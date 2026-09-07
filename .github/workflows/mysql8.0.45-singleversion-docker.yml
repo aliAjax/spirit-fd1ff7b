@@ -1,0 +1,55 @@
+name: MySQL 8.0.45 single-version suite /w docker-compose
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The suite runs twice: once against the GTID-enabled base compose.yml
+      # and once with the nogtid.yml overlay. The change-source coordinate
+      # scheme is auto-detected from the server, so the two runs exercise the
+      # resume/checkpoint paths over both schemes (GTID set, and binlog
+      # file+offset).
+      matrix:
+        include:
+          - name: gtid
+            compose-files: -f compose.yml
+          - name: nogtid
+            compose-files: -f compose.yml -f nogtid.yml
+    name: build (${{ matrix.name }})
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Detect non-docs changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!docs/**'
+
+      # Runs the version-agnostic "single-version" suite
+      # (pkg/migration/{resume,singleversion}_test.go, behind
+      # `//go:build singleversion`) against the base 8.0.45 image. The
+      # other version-matrix jobs omit the `singleversion` build tag and so skip
+      # these files. See the singleversion-test service in compose/compose.yml
+      # and the header of singleversion_test.go.
+      - name: Single-version suite
+        if: steps.filter.outputs.code == 'true'
+        env:
+          COMPOSE_FILES: ${{ matrix.compose-files }}
+        run: docker compose $COMPOSE_FILES up mysql singleversion-test --abort-on-container-exit --exit-code-from singleversion-test
+        working-directory: compose
+
+      - name: Skip — documentation-only change
+        if: steps.filter.outputs.code != 'true'
+        run: echo "Documentation-only change detected; skipping tests."
