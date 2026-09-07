@@ -108,6 +108,16 @@ type ReverseFeed struct {
 	fatalErr  error
 }
 
+// watchedTableNames returns the watched table names for one reverse source,
+// used to scope DDL-fatality to exactly the tables this feed tails.
+func watchedTableNames(tables []*table.TableInfo) []string {
+	names := make([]string, 0, len(tables))
+	for _, t := range tables {
+		names = append(names, t.TableName)
+	}
+	return names
+}
+
 // NewReverseFeed wires the feeds and their shared applier. It does not open any
 // binlog stream — call Start or Run for that — but it does query each source
 // server once: change.NewAutoClient selects (and validates) the change-source
@@ -209,6 +219,18 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 			ServerID:   change.NewServerID(),
 			DBConfig:   dbCfg,
 			CancelFunc: rf.onFatal,
+			// A schema change is only fatal when it hits a WATCHED table on the
+			// reverse source (the former target). Without this scope, DDL
+			// matching also covers the apply-side TableInfo (the subscription's
+			// newTable) — which on a same-instance topology (source and target
+			// on one MySQL server) collides with spirit's OWN cutover renames
+			// of the source tables (e.g. the un-retire rename replays through
+			// the rebuilt feed when completing an interrupted rollback). The
+			// watched tables live in exactly one schema on this connection
+			// (its default database), so Tables[0].SchemaName names it,
+			// mirroring the forward move's DDLFilterSchema/DDLFilterTables.
+			DDLFilterSchema: src.Tables[0].SchemaName,
+			DDLFilterTables: watchedTableNames(src.Tables),
 		}
 		// The captured start position's own encoding selects the change
 		// source implementation: it was captured by targetCurrentPosition in

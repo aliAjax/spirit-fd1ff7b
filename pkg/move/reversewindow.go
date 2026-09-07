@@ -11,7 +11,6 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/move/check"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -104,6 +103,12 @@ type reverseWindow struct {
 	// watched[i] is target i's real-name tables, used to lock and then retire
 	// the targets during a reverse cutover.
 	watched [][]*table.TableInfo
+	// resuming marks a reverse cutover being COMPLETED after a crash, entered
+	// via resumeReverting rather than the window loop. The source tables were
+	// just un-retired, so the feed applies to their real names; the stale
+	// _revert cleanup is skipped (a _revert table here is the decision's
+	// business, not a leftover); and every rename is idempotent.
+	resuming bool
 	// persistPhase, dropMarker and dropCheckpoint are the durable side effects
 	// of a reverse cutover, injectable so the ownership-boundary and
 	// finalize-retry behavior can be tested without a live topology.
@@ -116,7 +121,26 @@ func newReverseWindow(r *Runner) *reverseWindow {
 	return &reverseWindow{
 		r: r,
 		persistPhase: func(ctx context.Context, phase string) error {
-			return r.checkpointTbl().Write(ctx, checkpoint.Record{Phase: phase, CutoverAt: r.cutoverAt})
+			// Carry the reverse-feed start positions into every phase row.
+			// The reverting row in particular is written OVER the
+			// reverse_window row (single-row REPLACE), so omitting them would
+			// erase the only record of where the reverse feeds must restart:
+			// a resume that has to complete an interrupted rollback rebuilds
+			// the feed from these positions, and falling back to the targets'
+			// current head would silently skip post-cutover writes.
+			var posJSON string
+			if len(r.reversePositions) > 0 {
+				b, err := json.Marshal(r.reversePositions)
+				if err != nil {
+					return fmt.Errorf("marshal reverse positions: %w", err)
+				}
+				posJSON = string(b)
+			}
+			return r.checkpointTbl().Write(ctx, checkpoint.Record{
+				Phase:     phase,
+				CutoverAt: r.cutoverAt,
+				Position:  posJSON,
+			})
 		},
 		dropMarker:     func(ctx context.Context) error { return dropRevertMarker(ctx, r.targets[0].DB) },
 		dropCheckpoint: func(ctx context.Context) error { return r.checkpointTbl().Drop(ctx) },
@@ -185,18 +209,25 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 	src := &r.sources[0] // canonical source: table names and the _old TableInfos
 	sharded := len(r.sources) > 1
 
-	// The _old mapping TableInfos are built on sources[0]. Their names are
-	// unqualified, so with a sharded source the same mapping serves every
-	// shard — each shard's own connection determines the database written to
-	// (the shards' schemas are identical by the move's own invariant).
+	// The reverse destination tables are the source shards' tables. During the
+	// window they sit under their _old names (the forward cutover retired
+	// them); when completing an interrupted rollback the sources were just
+	// un-retired, so rows apply to the real names. These TableInfos are built
+	// on sources[0], unqualified — with a sharded source the same mapping
+	// serves every shard, since each shard's own connection determines the
+	// database written to (the shards' schemas are identical by the move's own
+	// invariant).
 	targetTables := make(map[string]*table.TableInfo, len(src.tables))
 	for _, t := range src.tables {
-		oldName := check.CutoverOldName(t.TableName)
-		oldTbl := table.NewTableInfo(src.db, src.config.DBName, oldName)
-		if err := oldTbl.SetInfo(ctx); err != nil {
-			return fmt.Errorf("reverse window: load renamed source table %q: %w", oldName, err)
+		destName := check.CutoverOldName(t.TableName)
+		if w.resuming {
+			destName = t.TableName
 		}
-		targetTables[t.TableName] = oldTbl
+		destTbl := table.NewTableInfo(src.db, src.config.DBName, destName)
+		if err := destTbl.SetInfo(ctx); err != nil {
+			return fmt.Errorf("reverse window: load reverse-target source table %q: %w", destName, err)
+		}
+		targetTables[t.TableName] = destTbl
 	}
 
 	// Reverse rows are routed to a source shard by the SOURCE keyspace's vindex,
@@ -318,9 +349,13 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	// renames each target table to its _revert form — a leftover from a prior
 	// reverse cutover would otherwise collide. Done before locking, since the
 	// leftovers are not in the lock set (DROP under LOCK TABLES is disallowed for
-	// unlocked tables).
-	if err := r.dropStaleRevertTables(ctx); err != nil {
-		return err
+	// unlocked tables). Skipped on a crash-resumed rollback: there a _revert
+	// table is the decision's evidence (a target already retired), never a
+	// leftover to drop.
+	if !w.resuming {
+		if err := r.dropStaleRevertTables(ctx); err != nil {
+			return err
+		}
 	}
 
 	// 1. Lock the reverse sources (former targets) to freeze their writes.
@@ -371,12 +406,13 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 
 	// 3. Un-retire the source: rename its _old tables back to their real names
 	//    (on every source shard) so it can serve again. The feed is stopped, so
-	//    nothing writes them.
+	//    nothing writes them. The rename is idempotent (a crash-resumed rollback
+	//    may have un-retired some or all shards before restarting): a table
+	//    already under its real name is skipped.
 	for si := range r.sources {
 		s := &r.sources[si]
 		for _, t := range r.sourceTables {
-			oldName := check.CutoverOldName(t.TableName)
-			if err := dbconn.Exec(ctx, s.db, "RENAME TABLE %n TO %n", oldName, t.TableName); err != nil {
+			if err := renameOldToRealIfPresent(ctx, s.db, t.TableName); err != nil {
 				if dbconn.IsConnectionLossError(err) {
 					return fmt.Errorf("%w: reverse cutover: un-retire source %d table %q, outcome unknown: %w",
 						status.ErrOwnershipAmbiguous, si, t.TableName, err)
@@ -395,12 +431,12 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	// 5. Retire the former targets to their _revert form under their lock —
 	//    fencing straggler writes after the switch, mirroring the forward
 	//    cutover's source rename. _revert (not _old) marks these as revert
-	//    artifacts, so a later move can safely drop them.
+	//    artifacts, so a later move can safely drop them. The rename is
+	//    idempotent for a crash-resumed rollback: a target already retired to
+	//    _revert is skipped.
 	for i := range r.targets {
 		for _, t := range r.sourceTables {
-			revertName := check.RevertRetiredName(t.TableName)
-			stmt := sqlescape.MustEscapeSQL("RENAME TABLE %n TO %n", t.TableName, revertName)
-			if err := locks[i].ExecUnderLock(ctx, stmt); err != nil {
+			if err := renameRealToRevertIfPresent(ctx, r.targets[i].DB, locks[i], t.TableName); err != nil {
 				if dbconn.IsConnectionLossError(err) {
 					return fmt.Errorf("%w: reverse cutover: retire target %d table %q, outcome unknown: %w",
 						status.ErrOwnershipAmbiguous, i, t.TableName, err)
@@ -411,6 +447,44 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	}
 
 	return w.finalizeReverse(ctx)
+}
+
+// waitCaughtUp drains a rebuilt reverse feed's downtime backlog before the
+// reverse cutover takes the target table locks, so those locks are held only
+// for the final drain. It is an optimization, not a correctness gate:
+// reverseCutover performs the authoritative flush under the locks and refuses
+// to proceed unless AllChangesFlushed. It drives the drain with an explicit
+// Flush each tick (the feed's periodic flush only fires every
+// change.DefaultFlushInterval, which would otherwise hold this loop open), and
+// requires two consecutive AllChangesFlushed readings to avoid a premature
+// "caught up" in the startup window before the first events stream in.
+func (w *reverseWindow) waitCaughtUp(ctx context.Context) error {
+	r := w.r
+	ticker := time.NewTicker(reverseWindowPollInterval)
+	defer ticker.Stop()
+	consecutive := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if ferr := w.feed.Err(); ferr != nil {
+				return fmt.Errorf("resume reverse cutover: reverse feed failed while catching up: %w", ferr)
+			}
+			if ferr := w.feed.Flush(ctx); ferr != nil {
+				return fmt.Errorf("resume reverse cutover: catch-up flush failed: %w", ferr)
+			}
+			if w.feed.AllChangesFlushed() {
+				consecutive++
+				if consecutive >= 2 {
+					r.logger.Info("resume reverse cutover: reverse feed drained the downtime backlog before locking targets")
+					return nil
+				}
+				continue
+			}
+			consecutive = 0
+		}
+	}
 }
 
 func (w *reverseWindow) runReverseCutoverCallback(ctx context.Context) error {

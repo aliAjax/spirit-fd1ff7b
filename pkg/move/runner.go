@@ -822,11 +822,13 @@ func (r *Runner) dropStaleRevertTables(ctx context.Context) error {
 // the checkpoint before any locks or discovery. Returns handled=true when it
 // owns the run.
 //
-// Not yet handled: an interrupted reverse *cutover* (phase "reverting") leaves
-// an ambiguous half-renamed state, so that surfaces as an ownership-ambiguous
-// error for manual completion rather than an unsafe auto-resume. Phase
-// "reverse_finalized" is different: ownership is already definitively back on
-// the source and only idempotent cleanup remains, so it is retried.
+// An interrupted reverse *cutover* (phase "reverting") is resumed by
+// resumeReverting, which inspects the physical table layout to decide whether
+// the rollback can be completed (the non-idempotent traffic switch provably
+// never ran), only idempotent final cleanup remains (the switch provably ran),
+// or the state is too ambiguous to touch (fail with ErrOwnershipAmbiguous).
+// Phase "reverse_finalized" likewise repeats only that idempotent cleanup.
+// None of these branches re-copies or re-runs the forward cutover.
 func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 	rec, err := r.checkpointTbl().ReadLatest(ctx)
 	if err != nil {
@@ -840,8 +842,8 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 		r.logger.Warn("resuming an interrupted reverse window from checkpoint", "cutover_at", rec.CutoverAt)
 		return true, r.resumeReverseWindow(ctx, rec)
 	case phaseReverting:
-		return true, fmt.Errorf("%w: a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually",
-			status.ErrOwnershipAmbiguous, rec.Phase)
+		r.logger.Warn("resuming an interrupted reverse cutover from checkpoint", "cutover_at", rec.CutoverAt)
+		return true, r.resumeReverting(ctx, rec)
 	case phaseReverseFinalized:
 		// Ownership is already definitive: every former target was retired
 		// before this phase was written. Only the idempotent cleanup that

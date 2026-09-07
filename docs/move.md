@@ -113,7 +113,11 @@ The marker and the checkpoint are dropped once the rollback completes.
 
 - **Unsharded source only.** `--reverse-window` requires a single source (a 1→M move). A sharded source would need an M:N reverse and is rejected at startup.
 - **Stale marker.** If `_spirit_move_revert` already exists when a move starts, or when it reaches cutover — e.g. left over from a prior interrupted rollback — the move refuses to run, so a leftover marker is never mistaken for a fresh request.
-- **Resume.** The checkpoint records that the move entered its reverse window (via a `move_phase` column and the cutover time), so a move killed *during* the window resumes back into it rather than re-copying. A move killed *mid-rollback* is not auto-resumed and must be completed manually.
+- **Resume.** The checkpoint records the move's phase (`move_phase`), the cutover time (`cutover_at`), and the reverse-feed start positions. A restart decides from that record *and* the physical table layout — it never re-copies or re-runs the forward cutover:
+  - killed *during the window* resumes back into the window (its deadline is measured from the recorded cutover time, so a window that elapsed while down completes forward immediately);
+  - killed *mid-rollback* (`reverting`) completes the rollback automatically when a source table is still retired to `_old` — the reverse traffic-switch hook then provably never ran, so the feed rebuilds from the checkpointed positions, downtime writes flow back, and the remaining renames, the hook, and the target retirement run once;
+  - killed *after* every rename but before cleanup retries only the idempotent final step (marker/checkpoint dropped);
+  - the move refuses to touch anything and fails with an ownership-ambiguous error when the switch may already have run (sources live but some target still serving), the layout is inconsistent, or the checkpoint lost the reverse positions — the checkpoint and marker are left in place for manual reconciliation.
 
 ```bash
 spirit move --reverse-window 30m \

@@ -10,9 +10,11 @@ package move
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -306,9 +308,38 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	require.False(t, tableExists(t, ctl, "rwrk_dst", "t1"), "target real table gone after rollback")
 }
 
+// runMoveToReverseWindow runs one move to the open reverse window, waits for
+// the source retire to land, then cancels it like a kill, leaving the
+// interrupted state (source *_old, target serving, checkpoint phase
+// reverse_window) in place.
+func runMoveToReverseWindow(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, srcDBName, dstDBName string) {
+	t.Helper()
+	run, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	run.SetCutover(func(context.Context) error { return nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = run.Run(ctx); close(runDone) }()
+	waitForReverseWindow(t, ctl, dstDBName)
+	waitForTable(t, ctl, srcDBName, "t1_old")
+	require.Eventually(t, func() bool {
+		return run.Progress().CurrentState == status.ReverseWindow
+	}, 30*time.Second, 50*time.Millisecond)
+	cancel()
+	<-runDone
+	utils.CloseAndLog(run)
+}
+
 // TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence verifies that a
-// resume refused before the reverse-window runner starts still publishes the
-// ownership ambiguity through Result.
+// resume in the zone where the reverse traffic switch MAY have run (all sources
+// un-retired but targets still serving) refuses to touch anything and still
+// publishes the ownership ambiguity through Result.
 func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) {
 	shortenReverseWindowPolling(t)
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwamb_src", "rwamb_dst")
@@ -325,34 +356,278 @@ func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) 
 		return runner
 	}
 
-	run1 := newRunner()
-	run1.SetCutover(func(context.Context) error { return nil })
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	run1Err := make(chan error, 1)
-	go func() { run1Err <- run1.Run(ctx1) }()
+	runMoveToReverseWindow(t, sourceDSN, targetDSN, ctl, "rwamb_src", "rwamb_dst")
 
-	waitForReverseWindow(t, ctl, "rwamb_dst")
-	waitForTable(t, ctl, "rwamb_src", "t1_old")
-	require.Eventually(t, func() bool {
-		return run1.Progress().CurrentState == status.ReverseWindow
-	}, 30*time.Second, 50*time.Millisecond)
-	cancel1()
-	require.ErrorIs(t, <-run1Err, context.Canceled)
-	utils.CloseAndLog(run1)
-
+	// Simulate a crash AFTER the sources were un-retired but BEFORE any target
+	// was retired: the switch may or may not have run, so resume must stop.
+	testutils.RunSQL(t, "RENAME TABLE rwamb_src.t1_old TO rwamb_src.t1")
 	testutils.RunSQL(t, "UPDATE rwamb_dst."+checkpointTableName+
 		" SET move_phase='"+phaseReverting+"' WHERE id=1")
 
 	run2 := newRunner()
 	defer utils.CloseAndLog(run2)
 	run2.SetCutover(func(context.Context) error {
-		t.Fatal("an ambiguous reverse-window resume must not restart forward cutover")
+		t.Fatal("an ambiguous reverse-cutover resume must not run the forward cutover")
+		return nil
+	})
+	run2.SetReverseCutover(func(context.Context) error {
+		t.Fatal("an ambiguous reverse-cutover resume must not run the reverse cutover hook")
 		return nil
 	})
 
 	err := run2.Run(t.Context())
 	require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
 	require.Equal(t, status.WorkflowTerminalOwnershipAmbiguous, run2.Result().TerminalOwnership)
+	// Nothing was moved or dropped: the layout is exactly the ambiguous one.
+	require.True(t, tableExists(t, ctl, "rwamb_src", "t1"), "source stays un-retired")
+	require.False(t, tableExists(t, ctl, "rwamb_src", "t1_old"))
+	require.True(t, tableExists(t, ctl, "rwamb_dst", "t1"), "target stays serving")
+	require.False(t, tableExists(t, ctl, "rwamb_dst", "t1_revert"))
+	require.True(t, tableExists(t, ctl, "rwamb_dst", checkpointTableName), "checkpoint is retained for manual reconciliation")
+}
+
+// TestMoveReverseWindowRevertingResumeCompletesRollback: a crash DURING the
+// reverse cutover, before any un-retire rename (phase=reverting, sources still
+// _old, targets serving), is resumed by COMPLETING the rollback: the reverse
+// feed rebuilds from the checkpointed positions, downtime writes on the target
+// flow back to the source, the reverse hook runs once, and the move ends
+// rolled back — without re-copying or re-running the forward cutover.
+func TestMoveReverseWindowRevertingResumeCompletesRollback(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwrc_src", "rwrc_dst")
+
+	runMoveToReverseWindow(t, sourceDSN, targetDSN, ctl, "rwrc_src", "rwrc_dst")
+
+	// The persisted reverting row keeps the reverse positions (as the real
+	// persistPhase now writes them). A write lands on the target while spirit
+	// is down — traffic is still on the target because the switch never ran.
+	testutils.RunSQL(t, "UPDATE rwrc_dst."+checkpointTableName+
+		" SET move_phase='"+phaseReverting+"' WHERE id=1")
+	testutils.RunSQL(t, "INSERT INTO rwrc_dst.t1 (id, val) VALUES (97,'downtime')")
+
+	run2, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(run2)
+	run2.SetCutover(func(context.Context) error {
+		t.Error("resume must NOT run the forward cutover again (it re-copied instead of resuming)")
+		return nil
+	})
+	var reverseRuns atomic.Int32
+	run2.SetReverseCutover(func(context.Context) error { reverseRuns.Add(1); return nil })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- run2.Run(context.Background()) }()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("timed out waiting for the resumed rollback to complete")
+	}
+
+	require.EqualValues(t, 1, reverseRuns.Load(), "reverse cutover hook must run exactly once (it never ran before the crash)")
+	// The downtime write flowed back to the source before the switch.
+	var val string
+	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT val FROM rwrc_src.t1 WHERE id=97").Scan(&val))
+	require.Equal(t, "downtime", val)
+	// Source is un-retired and serving; target retired to _revert; artifacts gone.
+	require.True(t, tableExists(t, ctl, "rwrc_src", "t1"), "source should be serving")
+	require.False(t, tableExists(t, ctl, "rwrc_src", "t1_old"), "source _old should be gone")
+	require.True(t, tableExists(t, ctl, "rwrc_dst", "t1_revert"), "target should be retired to _revert")
+	require.False(t, tableExists(t, ctl, "rwrc_dst", "t1"), "target real table should be gone")
+	require.False(t, tableExists(t, ctl, "rwrc_dst", checkpointTableName), "checkpoint should be dropped")
+	require.False(t, tableExists(t, ctl, "rwrc_dst", revertMarkerName), "revert marker should be dropped")
+	require.Equal(t, status.WorkflowTerminalOwnershipReverseFinalized, run2.Result().TerminalOwnership)
+}
+
+// TestMoveReverseWindowRevertingResumeNM: the same recovery for a 2:2 sharded
+// move — downtime writes on both target shards route back to the owning source
+// shards. (Name kept short: CreateUniqueTestDatabase truncates DB names to 64
+// chars, and four per-fixture DBs must keep their distinct counter suffix.)
+func TestMoveReverseWindowRevertingResumeNM(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	f := setupNMReverseFixture(t)
+
+	run1 := f.newRunner(t, 30*time.Second)
+	run1.SetCutover(func(context.Context) error { return nil })
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	run1Err := make(chan error, 1)
+	go func() { run1Err <- run1.Run(ctx1) }()
+
+	waitForReverseWindow(t, f.ctl, f.checkpointDBName)
+	waitForTable(t, f.ctl, f.srcEvenName, "users_old")
+	waitForTable(t, f.ctl, f.srcOddName, "users_old")
+	require.Eventually(t, func() bool {
+		return run1.Progress().CurrentState == status.ReverseWindow
+	}, 30*time.Second, 50*time.Millisecond, "run 1 must reach the reverse-window state")
+	cancel1()
+	require.ErrorIs(t, <-run1Err, context.Canceled)
+	utils.CloseAndLog(run1)
+
+	// Crash during the reverse cutover, before any un-retire.
+	testutils.RunSQL(t, "UPDATE "+f.checkpointDBName+"."+checkpointTableName+
+		" SET move_phase='"+phaseReverting+"' WHERE id=1")
+	// Downtime writes: one per target shard, on the shard that serves each row.
+	testutils.RunSQL(t, "INSERT INTO "+f.tgtEvenName+".users VALUES (10,'ten')")
+	testutils.RunSQL(t, "INSERT INTO "+f.tgtOddName+".users VALUES (11,'eleven')")
+
+	run2 := f.newRunner(t, 30*time.Second)
+	defer utils.CloseAndLog(run2)
+	run2.SetCutover(func(context.Context) error {
+		t.Error("resume must NOT run the forward cutover again")
+		return nil
+	})
+	var reverseRuns atomic.Int32
+	run2.SetReverseCutover(func(context.Context) error { reverseRuns.Add(1); return nil })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- run2.Run(context.Background()) }()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(90 * time.Second):
+		t.Fatal("timed out waiting for the resumed N:M rollback to complete")
+	}
+
+	require.EqualValues(t, 1, reverseRuns.Load(), "reverse cutover hook must run exactly once")
+	require.Equal(t, map[int64]string{2: "two", 4: "four", 10: "ten"}, f.rows(t, f.srcEvenName),
+		"even downtime rows must route back to the even source shard")
+	require.Equal(t, map[int64]string{1: "one", 3: "three", 11: "eleven"}, f.rows(t, f.srcOddName),
+		"odd downtime rows must route back to the odd source shard")
+	for _, src := range []string{f.srcEvenName, f.srcOddName} {
+		require.True(t, tableExists(t, f.ctl, src, "users"), "source %s must be serving", src)
+		require.False(t, tableExists(t, f.ctl, src, "users_old"), "source %s _old must be gone", src)
+	}
+	for _, tgt := range []string{f.tgtEvenName, f.tgtOddName} {
+		require.True(t, tableExists(t, f.ctl, tgt, "users_revert"), "target %s must be retired to _revert", tgt)
+		require.False(t, tableExists(t, f.ctl, tgt, "users"), "target %s real table must be gone", tgt)
+	}
+	require.False(t, tableExists(t, f.ctl, f.checkpointDBName, checkpointTableName), "checkpoint should be dropped")
+}
+
+// TestMoveReverseWindowRevertingResumeFinalizes: a crash after every rename
+// (sources un-retired, targets retired to _revert) but before the cleanup
+// record lands — ownership is definitively on the source, so resume only runs
+// the idempotent finalize: no feed, no hooks, marker and checkpoint dropped.
+func TestMoveReverseWindowRevertingResumeFinalizes(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwfn_src", "rwfn_dst")
+
+	runMoveToReverseWindow(t, sourceDSN, targetDSN, ctl, "rwfn_src", "rwfn_dst")
+
+	// Roll every rename to completion by hand, as a finished cutover would.
+	testutils.RunSQL(t, "RENAME TABLE rwfn_src.t1_old TO rwfn_src.t1")
+	testutils.RunSQL(t, "RENAME TABLE rwfn_dst.t1 TO rwfn_dst.t1_revert")
+	testutils.RunSQL(t, "CREATE TABLE rwfn_dst."+revertMarkerName+" (id INT)")
+	testutils.RunSQL(t, "UPDATE rwfn_dst."+checkpointTableName+
+		" SET move_phase='"+phaseReverting+"' WHERE id=1")
+
+	run2, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(run2)
+	run2.SetCutover(func(context.Context) error {
+		t.Fatal("a finalize resume must not run the forward cutover")
+		return nil
+	})
+	run2.SetReverseCutover(func(context.Context) error {
+		t.Fatal("a finalize resume must not run the reverse cutover hook again")
+		return nil
+	})
+
+	require.NoError(t, run2.Run(t.Context()))
+
+	require.True(t, tableExists(t, ctl, "rwfn_src", "t1"), "source should be serving")
+	require.False(t, tableExists(t, ctl, "rwfn_src", "t1_old"))
+	require.True(t, tableExists(t, ctl, "rwfn_dst", "t1_revert"), "target stays retired")
+	require.False(t, tableExists(t, ctl, "rwfn_dst", "t1"))
+	require.False(t, tableExists(t, ctl, "rwfn_dst", checkpointTableName), "checkpoint should be dropped")
+	require.False(t, tableExists(t, ctl, "rwfn_dst", revertMarkerName), "revert marker should be dropped")
+	require.Equal(t, status.WorkflowTerminalOwnershipReverseFinalized, run2.Result().TerminalOwnership)
+}
+
+// TestMoveReverseWindowRevertingResumeMissingPositions: an unfinished rollback
+// whose checkpoint lost the reverse-feed start positions must terminate rather
+// than rebuild the feed from the targets' current head (which would silently
+// skip downtime writes). Nothing is renamed or dropped.
+func TestMoveReverseWindowRevertingResumeMissingPositions(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwmp_src", "rwmp_dst")
+
+	runMoveToReverseWindow(t, sourceDSN, targetDSN, ctl, "rwmp_src", "rwmp_dst")
+
+	testutils.RunSQL(t, "UPDATE rwmp_dst."+checkpointTableName+
+		" SET move_phase='"+phaseReverting+"', binlog_position='' WHERE id=1")
+
+	run2, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(run2)
+	run2.SetCutover(func(context.Context) error {
+		t.Fatal("an ambiguous resume must not run the forward cutover")
+		return nil
+	})
+	run2.SetReverseCutover(func(context.Context) error {
+		t.Fatal("an ambiguous resume must not run the reverse cutover hook")
+		return nil
+	})
+
+	err = run2.Run(t.Context())
+	require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
+	require.Contains(t, err.Error(), "position", "the error must name the missing reverse-feed positions as the cause")
+	require.True(t, tableExists(t, ctl, "rwmp_src", "t1_old"), "source stays retired")
+	require.False(t, tableExists(t, ctl, "rwmp_src", "t1"))
+	require.True(t, tableExists(t, ctl, "rwmp_dst", "t1"), "target stays serving")
+	require.False(t, tableExists(t, ctl, "rwmp_dst", "t1_revert"))
+	require.True(t, tableExists(t, ctl, "rwmp_dst", checkpointTableName), "checkpoint retained")
+}
+
+// TestPersistPhaseCarriesReversePositions verifies the real persistPhase
+// closure writes the reverse-feed start positions and cutover time into every
+// phase row, so an interrupted rollback can rebuild the feed after a crash.
+func TestPersistPhaseCarriesReversePositions(t *testing.T) {
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+
+	r := &Runner{
+		move:    &Move{},
+		logger:  slog.Default(),
+		targets: []applier.Target{{DB: db, Config: cfg, KeyRange: "0"}},
+	}
+	const pos = "test-position-123"
+	r.reversePositions = map[string]string{targetKey(r.targets[0]): pos}
+	r.cutoverAt = time.Now().Add(-time.Minute)
+
+	w := newReverseWindow(r)
+	require.NoError(t, r.checkpointTbl().Create(t.Context()))
+	require.NoError(t, w.persistPhase(t.Context(), phaseReverting))
+
+	rec, err := r.checkpointTbl().ReadLatest(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, phaseReverting, rec.Phase)
+	require.False(t, rec.CutoverAt.IsZero(), "cutover_at must be persisted")
+	var got map[string]string
+	require.NoError(t, json.Unmarshal([]byte(rec.Position), &got))
+	require.Equal(t, pos, got[targetKey(r.targets[0])], "reverse positions must survive into the reverting row")
 }
 
 // TestMoveReverseWindowRefusesStaleRevertMarker: a leftover revert marker on
